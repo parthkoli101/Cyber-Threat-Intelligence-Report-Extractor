@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cyber Incident Report Analyzer</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header><h1>Cyber Incident Report Analyzer</h1>
+<p>Upload an incident report PDF and get a structured, source-verified analysis.</p></header>
+<main>
+  <div id="error" class="error"></div>
+  <div class="card" id="upload">
+    <form id="form" class="upload">
+      <input type="file" id="file" accept="application/pdf,.pdf" required>
+      <button type="submit" id="go">Analyze</button>
+      <div class="spinner" id="spin"></div><span id="status" class="muted"></span>
+    </form>
+  </div>
+  <div class="card" id="prev"><h3>Previous reports</h3><div id="prevlist" class="muted">Loading...</div></div>
+  <div id="report"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let charts = [];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const PAL = ["#1f4fd8","#e5484d","#f5a524","#2fa36b","#8e4ec6","#00a2c7","#d6409f","#6b7280"];
+
+function showError(msg){ const e=$("error"); e.textContent=msg; e.classList.toggle("on", !!msg); }
+
+async function api(url, opts){
+  let r; try { r = await fetch(url, opts); } catch(e){ throw new Error("Cannot reach the server. Is 'python app.py' still running?"); }
+  let d = {}; try { d = await r.json(); } catch(e){}
+  if(!r.ok) throw new Error(d.error || "Request failed ("+r.status+")");
+  return d;
+}
+
+async function loadPrev(){
+  try{
+    const list = await api("/api/reports");
+    $("prevlist").innerHTML = list.length ? "<ul>"+list.map(x =>
+      `<li><a href="#${x.id}">${esc(x.title || x.filename)}</a><span class="muted">${esc(x.filename)} &middot; ${esc(x.uploaded_at)}</span></li>`).join("")+"</ul>"
+      : "No reports yet. Upload a PDF above.";
+  }catch(e){ $("prevlist").textContent = "Could not load previous reports."; showError(e.message); }
+}
+
+$("form").addEventListener("submit", async ev => {
+  ev.preventDefault(); showError("");
+  const f = $("file").files[0];
+  if(!f || !/\.pdf$/i.test(f.name)){ showError("Please choose a PDF file."); return; }
+  const fd = new FormData(); fd.append("file", f);
+  $("go").disabled = true; $("spin").classList.add("on"); $("status").textContent = "Analyzing... this can take a minute.";
+  try{
+    const d = await api("/api/analyze", {method:"POST", body:fd});
+    if(location.hash.slice(1) === d.id) render(d.id, d.report); else location.hash = d.id;  // hashchange loads it
+    loadPrev();
+  }catch(e){ showError(e.message); }
+  $("go").disabled = false; $("spin").classList.remove("on"); $("status").textContent = "";
+});
+
+async function openFromHash(){
+  const id = location.hash.slice(1);
+  if(!id){ $("report").innerHTML = ""; return; }
+  showError("");
+  try{ const d = await api("/api/reports/"+id); render(id, d.report); }
+  catch(e){ showError(e.message); }
+}
+window.addEventListener("hashchange", openFromHash);
+
+function tableHtml(t){
+  return `<details open><summary>${esc(t.name)} (${t.rows.length})</summary><div class="wrap"><table><thead><tr>${
+    t.columns.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${
+    t.rows.map(r=>`<tr>${r.map(c=>`<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div></details>`;
+}
+const chartCard = c => `<div class="chart-card"><h4>${esc(c.title)}</h4><div class="chart-box"><canvas id="ch-${c.id}"></canvas></div><p>${esc(c.explanation)}</p></div>`;
+
+function render(id, rep){
+  const dash = rep.layout === "dashboard";
+  const keys = `<div class="keys">${Object.entries(rep.key_points).map(([k,v])=>`<div class="key"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}</div>`;
+  const secs = rep.sections.map(s => {
+    const inl = dash ? "" : rep.charts.filter(c=>c.section===s.no).map(chartCard).join("");
+    const body = s.empty && !inl ? '<p class="none">No relevant data found</p>' :
+      (s.summary ? `<p>${esc(s.summary)}</p>` : "") + inl + s.tables.map(tableHtml).join("") +
+      (!s.tables.length && !s.summary ? '<p class="none">No relevant data found</p>' : "");
+    return `<section class="card"><h3>${s.no}. ${esc(s.title)}</h3>${body}</section>`;
+  }).join("");
+  $("report").innerHTML = `<div class="toolbar"><h2>${esc(rep.title)}</h2>
+    <button class="alt" id="pdfbtn">Download report as PDF</button><button class="alt" id="jsonbtn">Download JSON</button></div>
+    <p class="muted">${rep.pages} page(s), ${rep.sentences} sentences analysed. Every item lists its source page and original sentence.</p>` +
+    (dash ? `<div class="dash">${rep.charts.map(chartCard).join("")}</div>` : "") + keys + secs;
+  $("pdfbtn").onclick = () => window.print();
+  $("jsonbtn").onclick = () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(rep, null, 2)], {type:"application/json"}));
+    a.download = "incident-report-"+id+".json"; a.click();
+  };
+  drawCharts(rep.charts);
+  $("report").scrollIntoView({behavior:"smooth"});
+}
+
+function drawCharts(list){
+  charts.forEach(c=>c.destroy()); charts = [];
+  if(typeof Chart === "undefined") return;   // CDN not reachable: the explanations still show
+  list.forEach(c => {
+    const el = $("ch-"+c.id); if(!el) return;
+    const pie = c.type==="pie" || c.type==="doughnut";
+    charts.push(new Chart(el, {type:c.type,
+      data:{labels:c.labels, datasets:[{data:c.data, label:c.title, backgroundColor: pie||c.type==="bar" ? c.labels.map((_,i)=>PAL[i%PAL.length]) : "#1f4fd8",
+        borderColor:"#1f4fd8", tension:.25}]},
+      options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{display:pie}},
+        scales: pie ? {} : {y:{beginAtZero:!c.log, type:c.log?"logarithmic":"linear", ticks:c.type==="line"?{precision:0}:{}}, x:{ticks:{autoSkip:false, maxRotation:60}}}}}));
+  });
+}
+window.addEventListener("beforeprint", () => document.querySelectorAll("details").forEach(d => d.open = true));
+loadPrev(); openFromHash();
+</script>
+</body>
+</html>
